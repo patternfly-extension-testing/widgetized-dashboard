@@ -1,46 +1,78 @@
 name: pr-preview
-on: pull_request_target
+on:
+  pull_request_target:
+  issue_comment:
+    types: [created]
+
 jobs:
-  build-upload:
+  check-permissions:
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        contains(github.event.comment.body, '/deploy-preview'))
+    outputs:
+      allowed: ${{ steps.check-team.outputs.allowed }}
+      pr-number: ${{ steps.check-team.outputs.number }}
+    steps:
+      - name: Get PR info and check permissions
+        id: check-team
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          COMMENT_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ASSOCIATION: ${{ github.event.comment.author_association }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request_target" ]]; then
+            echo "number=$PR_NUMBER" >> $GITHUB_OUTPUT
+            ASSOCIATION="$PR_ASSOCIATION"
+          else
+            echo "number=$COMMENT_NUMBER" >> $GITHUB_OUTPUT
+            ASSOCIATION="$COMMENT_ASSOCIATION"
+          fi
+
+          if [[ "$ASSOCIATION" == "OWNER" || "$ASSOCIATION" == "MEMBER" || "$ASSOCIATION" == "COLLABORATOR" ]]; then
+            echo "allowed=true" >> $GITHUB_OUTPUT
+            echo "User is a repo $ASSOCIATION — allowed"
+          else
+            echo "allowed=false" >> $GITHUB_OUTPUT
+            echo "User association is $ASSOCIATION — not allowed"
+          fi
+
+  deploy-preview:
+    runs-on: ubuntu-latest
+    needs: check-permissions
+    if: needs.check-permissions.outputs.allowed == 'true'
     env:
       SURGE_LOGIN: ${{ secrets.SURGE_LOGIN }}
       SURGE_TOKEN: ${{ secrets.SURGE_TOKEN }}
       GH_PR_TOKEN: ${{ secrets.GH_PR_TOKEN }}
-      GH_PR_NUM:   ${{ github.event.number }}
+      GH_PR_NUM: ${{ needs.check-permissions.outputs.pr-number }}
     steps:
       - uses: actions/checkout@v4
-      # Yes, we really want to checkout the PR
       - run: |
           git fetch origin pull/$GH_PR_NUM/head:tmp
           git checkout tmp
-
-      - run: |
-          git rev-parse origin/main
-          git rev-parse HEAD
-          git rev-parse origin/main..HEAD
-          git log origin/main..HEAD --format="%b"
-
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Enable Corepack
-        shell: bash
-        run: corepack enable
+      - run: corepack enable
       - uses: actions/cache@v4
         id: yarn-cache
         name: Load Yarn cache
         with:
           path: |
             .yarn/cache
-          key: ${{ runner.os }}-yarn-cache-${{ hashFiles('yarn.lock') }}
+          key: ${{ runner.os }}-yarn-cache-${{ secrets.CACHE_VERSION }}-${{ hashFiles('yarn.lock') }}
           restore-keys: |
             ${{ runner.os }}-yarn-cache-
       - name: Install dependencies
         shell: bash
         run: yarn install --immutable --network-timeout 100000
       - run: yarn build
-        name: Build component groups
+        name: Build
       - uses: actions/cache@v4
         id: docs-cache
         name: Load webpack cache
@@ -49,11 +81,7 @@ jobs:
           key: ${{ runner.os }}-v4-${{ hashFiles('yarn.lock') }}
       - run: yarn build:docs
         name: Build docs
-      - name: Deploy preview to surge
-        if: env.SURGE_LOGIN != '' && env.SURGE_TOKEN != ''
-        run: |
-          npx surge packages/module/public --domain pr-${{ github.event.number }}-widgetized-dashboard.surge.sh
-      - name: Install Chrome for Puppeteer
-        run: npx puppeteer browsers install chrome
-      - name: a11y tests
-        run: yarn serve:docs & yarn test:a11y
+      - name: Upload docs
+        uses: patternfly/.github/.github/actions/surge-preview@main
+        with:
+          folder: packages/module/public
